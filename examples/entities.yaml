@@ -1,0 +1,17 @@
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: http2-experiments
+spec:
+  owner: guests
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: http2-backend
+  description: Backstage backend served over HTTP/2
+spec:
+  type: service
+  lifecycle: experimental
+  owner: guests
+  system: http2-experiments

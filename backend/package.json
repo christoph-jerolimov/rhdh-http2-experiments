@@ -1,0 +1,29 @@
+{
+  "name": "rhdh-http2-backend",
+  "version": "0.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "NODE_EXTRA_CA_CERTS=../certs/cert.pem tsx src/index.ts --config app-config.yaml",
+    "test": "node --test --test-reporter=spec test/*.test.mjs",
+    "tsc": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@backstage/backend-defaults": "^0.18.1",
+    "@backstage/backend-plugin-api": "^1.11.0",
+    "@backstage/plugin-auth-backend": "^0.30.2",
+    "@backstage/plugin-auth-backend-module-guest-provider": "^0.2.24",
+    "@backstage/plugin-catalog-backend": "^4.0.2",
+    "@backstage/plugin-permission-backend": "^0.7.17",
+    "@backstage/plugin-permission-backend-module-allow-all-policy": "^0.2.24",
+    "@backstage/plugin-proxy-backend": "^0.6.19",
+    "better-sqlite3": "^12.11.1",
+    "express": "^4.22.3"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.25",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

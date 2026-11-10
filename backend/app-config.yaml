@@ -1,0 +1,42 @@
+app:
+  baseUrl: https://localhost:3000
+
+backend:
+  baseUrl: https://localhost:7007
+  listen:
+    port: 7007
+  # Read by src/http2/http2RootHttpRouterServiceFactory.ts (not a Backstage option).
+  http2:
+    # Serve HTTP/2 (plus HTTP/1.1 via ALPN). Requires backend.https.
+    enabled: true
+    # Patch Express so it can handle HTTP/2 requests. Set to false to see it break.
+    expressBridge: true
+  https:
+    certificate:
+      cert:
+        $file: ../certs/cert.pem
+      key:
+        $file: ../certs/key.pem
+  database:
+    client: better-sqlite3
+    connection: ':memory:'
+
+auth:
+  providers:
+    guest:
+      dangerouslyAllowOutsideDevelopment: true
+
+permission:
+  enabled: true
+
+catalog:
+  rules:
+    - allow: [Component, System, API, Group, User, Location]
+  locations:
+    - type: file
+      target: ../examples/entities.yaml
+
+proxy:
+  endpoints:
+    /upstream:
+      target: http://localhost:7070
