@@ -28,8 +28,9 @@ curl -k --http2 https://localhost:7007/api/probe/info
 
 The response contains `"httpVersion":"2.0"`. With `--http1.1` it shows `"1.1"`.
 
-Tests (start the backend in a child process, about 15 seconds; the Chromium
-test is skipped if Playwright isn't installed):
+Tests (start the backend in child processes, about 40 seconds because the
+slow-client test waits for Node's 30-second timeout check; the Chromium test is
+skipped if Playwright isn't installed):
 
 ```bash
 cd backend && npm test
@@ -45,6 +46,7 @@ cd backend && npm test
 | `backend/src/plugins/probe.ts` | Test plugin at `/api/probe` (request info, JSON body, redirect, gzip, SSE, errors, publishing a signal). |
 | `backend/test/http2.test.mjs` | End-to-end tests over HTTP/2 and HTTP/1.1. |
 | `backend/test/websocket.test.mjs` | WebSocket tests with the signals plugin, including headless Chromium. |
+| `backend/test/timeouts.test.mjs` | Slow-client (slowloris) and idle-connection timeouts. |
 
 Config (`backend/app-config.yaml`), custom keys:
 
@@ -53,7 +55,16 @@ backend:
   http2:
     enabled: true        # false = stock HTTP/1.1 server
     expressBridge: true  # false = no bridge; HTTP/2 requests fail (for comparison)
+    allowedHosts: []     # extra hosts besides backend.baseUrl's; ['*'] = no 421 check
+    maxConcurrentStreams: 100  # parallel requests per connection
+    maxHeaderListSize: 16384   # bytes, same as Node's HTTP/1.1 limit
+    idleSessionTimeout: 2m     # close HTTP/2 connections with no open request
 ```
+
+`backend.server.headersTimeout`, `requestTimeout`, `keepAliveTimeout`,
+`maxHeadersCount` and `maxRequestsPerSocket` work as upstream and apply to
+HTTP/1.1 connections. `backend.server.timeout` is not supported with HTTP/2,
+because Node would also cut HTTP/2 connections with long-running requests.
 
 HTTP/2 needs `backend.https` with a PEM certificate, because browsers only use
 HTTP/2 over TLS. `backend.https: true` (generated certificate) is not supported here.
@@ -138,11 +149,37 @@ Tested with the signals plugin (`/api/signals`):
 - **Express sub-apps.** Only the root app is patched. A plugin that mounts its
   own `express()` app (instead of `Router()`) would break over HTTP/2. None of
   the plugins here do. Check RHDH's dynamic plugins before relying on this.
-- **Not ported from upstream:** `backend.server.*` timeouts and
+- **Not ported from upstream:** `backend.server.timeout` (see above) and
   `backend.lifecycle.serverShutdownDelay`.
 - `req.socket` / `req.connection` on HTTP/2 is a proxy for the shared session
   socket. Code that writes to it directly, or destroys it, affects every
   stream on the connection.
+
+## Security
+
+**Auth can't mix between users.** On HTTP/2 every request is its own stream
+with its own headers, so `Authorization` and cookies are per request. The
+bridge keeps no per-request state on shared objects. Test: 400 HTTP/2 requests
+on one connection plus 40 HTTP/1.1 requests, interleaving a guest user, two
+service tokens and anonymous calls, each resolve to their own principal.
+
+What the server adds on top of the bridge:
+
+| Risk | Protection | Tested |
+|---|---|---|
+| Connection coalescing: browsers reuse an HTTP/2 connection for other hostnames the certificate covers, so other apps' requests (with their cookies) could arrive here | HTTP/2 requests whose `:authority` isn't `backend.baseUrl`'s host or in `allowedHosts` get **421 Misdirected Request**; browsers retry on a new connection. HTTP/1.1 is not affected by coalescing and isn't checked. Also: don't use a wildcard certificate on the backend. | ✅ |
+| Too many parallel streams (Node's default is unlimited) | `maxConcurrentStreams: 100`; excess streams get `REFUSED_STREAM`, browsers queue | ✅ |
+| Huge headers (default unlimited) | `maxHeaderListSize: 16384`; that stream is reset (`ENHANCE_YOUR_CALM`), the connection survives | ✅ |
+| Idle HTTP/2 connections held open forever (Node's default) | `idleSessionTimeout` closes connections with no open request (GOAWAY). Quiet long-running requests (SSE, long polling) keep it open. | ✅ |
+| Slow HTTP/1.1 clients (slowloris) | Node's `headersTimeout` (60s) is enforced for HTTP/1.1 connections on the HTTP/2 server too, checked every 30s | ✅ with 1s |
+| Request smuggling when the proxy plugin turns HTTP/2 into HTTP/1.1 | Node rejects a `Content-Length` that doesn't match the body; header values with CR/LF never reach the upstream; NUL is rejected | checked by hand |
+
+Not covered here: HTTP/2-specific DoS bugs such as Rapid Reset
+(CVE-2023-44487) and the CONTINUATION flood (CVE-2024-27983) are fixed in
+Node itself, so keep Node up to date. Code that treats one connection as one
+user (state keyed on `req.socket`, NTLM/Kerberos) is wrong behind any proxy
+that reuses connections, HTTP/1.1 keep-alive included; check RHDH dynamic
+plugins for it.
 
 ## Alternative
 

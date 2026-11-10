@@ -9,6 +9,18 @@ export type Http2BackendServer = http2.Http2SecureServer & {
   port(): number;
 };
 
+export interface Http2Options {
+  /** HTTP/2 SETTINGS sent to every client (stream and header limits). */
+  settings: http2.Settings;
+  /**
+   * Values accepted in `:authority` (`host` or `host:port`, lowercase).
+   * Other HTTP/2 requests get 421 Misdirected Request. Undefined accepts all.
+   */
+  allowedAuthorities?: string[];
+  /** Close HTTP/2 sessions that had no open stream for this long (ms). 0 = never. */
+  idleSessionTimeout: number;
+}
+
 /**
  * Like `createHttpServer` from `@backstage/backend-defaults/rootHttpRouter`,
  * but creates a TLS server that speaks HTTP/2 and falls back to HTTP/1.1 for
@@ -17,6 +29,7 @@ export type Http2BackendServer = http2.Http2SecureServer & {
 export function createHttp2Server(
   listener: (req: any, res: any) => void,
   options: HttpServerOptions,
+  http2Options: Http2Options,
   deps: { logger: LoggerService },
 ): Http2BackendServer {
   const certificate = options.https?.certificate;
@@ -32,8 +45,13 @@ export function createHttp2Server(
   }
 
   const server = http2.createSecureServer(
-    { cert: certificate.cert, key: certificate.key, allowHTTP1: true },
-    listener,
+    {
+      cert: certificate.cert,
+      key: certificate.key,
+      allowHTTP1: true,
+      settings: http2Options.settings,
+    },
+    rejectMisdirectedRequests(listener, http2Options.allowedAuthorities, deps.logger),
   );
 
   // Track connections so stop() can close them. HTTP/2 connections show up
@@ -43,6 +61,7 @@ export function createHttp2Server(
   server.on('session', session => {
     sessions.add(session);
     session.on('close', () => sessions.delete(session));
+    closeWhenIdle(session, http2Options.idleSessionTimeout);
   });
   server.on('secureConnection', socket => {
     sockets.add(socket);
@@ -88,4 +107,80 @@ export function createHttp2Server(
       return address.port;
     },
   });
+}
+
+/**
+ * Browsers reuse an HTTP/2 connection for other hostnames when the
+ * certificate covers them and they resolve to the same IP ("connection
+ * coalescing"). With a wildcard certificate, requests for other apps (with
+ * their cookies) could then arrive here. Answering 421 makes the browser
+ * retry on a new connection to the right server (RFC 9110 15.5.20).
+ *
+ * Only HTTP/2 requests are checked: coalescing doesn't exist in HTTP/1.1.
+ */
+function rejectMisdirectedRequests(
+  listener: (req: any, res: any) => void,
+  allowedAuthorities: string[] | undefined,
+  logger: LoggerService,
+) {
+  if (!allowedAuthorities) {
+    return listener;
+  }
+  const allowed = new Set(allowedAuthorities.map(a => a.toLowerCase()));
+  const warned = new Set<string>();
+  return (req: any, res: any) => {
+    if (req instanceof http2.Http2ServerRequest) {
+      const authority = (req.authority ?? '').toLowerCase();
+      if (!allowed.has(authority)) {
+        // Log each unknown authority once (capped, it's client-controlled).
+        if (warned.size < 100 && !warned.has(authority)) {
+          warned.add(authority);
+          logger.warn(
+            `Rejected HTTP/2 request for authority '${authority}' with 421; add it to backend.http2.allowedHosts if it is expected`,
+          );
+        }
+        res.writeHead(421, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: {
+              name: 'MisdirectedRequestError',
+              message: 'This server does not serve the requested host',
+            },
+            response: { statusCode: 421 },
+          }),
+        );
+        return;
+      }
+    }
+    listener(req, res);
+  };
+}
+
+/**
+ * Closes the session gracefully (GOAWAY) once it has had no open stream for
+ * `timeout` ms. Node's own server.timeout would destroy sessions even while
+ * long-running streams (SSE, long polling) are open.
+ */
+function closeWhenIdle(session: http2.ServerHttp2Session, timeout: number) {
+  if (timeout <= 0) {
+    return;
+  }
+  let openStreams = 0;
+  let timer: NodeJS.Timeout | undefined;
+  const arm = () => {
+    timer = setTimeout(() => session.close(), timeout);
+    timer.unref();
+  };
+  arm();
+  session.on('stream', stream => {
+    openStreams += 1;
+    clearTimeout(timer);
+    stream.on('close', () => {
+      openStreams -= 1;
+      if (openStreams === 0 && !session.closed) {
+        arm();
+      }
+    });
+  });
+  session.on('close', () => clearTimeout(timer));
 }

@@ -39,8 +39,17 @@ export async function startUpstream() {
   return { port: server.address().port, seen, close: () => server.close() };
 }
 
-/** Starts the backend in a child process with extra config layered on top. */
-export async function startBackend({ http2 = true, expressBridge = true, upstreamPort } = {}) {
+/** Static tokens accepted by every test backend (service principals). */
+export const STATIC_TOKENS = {
+  alice: 'alice-static-token-0001',
+  bob: 'bob-static-token-0002',
+};
+
+/**
+ * Starts the backend in a child process. `config` is layered on top of the
+ * test config (Backstage deep-merges config files).
+ */
+export async function startBackend({ http2 = true, expressBridge = true, upstreamPort, config } = {}) {
   const ca = ensureCert();
   const port = await freePort();
   const dir = mkdtempSync(join(tmpdir(), 'h2-backend-'));
@@ -51,7 +60,13 @@ export async function startBackend({ http2 = true, expressBridge = true, upstrea
       backend: {
         baseUrl: `https://localhost:${port}`,
         listen: { port },
-        http2: { enabled: http2, expressBridge },
+        http2: { enabled: http2, expressBridge, allowedHosts: ['alias.example.com'] },
+        auth: {
+          externalAccess: Object.entries(STATIC_TOKENS).map(([subject, token]) => ({
+            type: 'static',
+            options: { token, subject },
+          })),
+        },
       },
       proxy: {
         endpoints: {
@@ -65,9 +80,16 @@ export async function startBackend({ http2 = true, expressBridge = true, upstrea
     }),
   );
 
+  const configArgs = ['--config', 'app-config.yaml', '--config', configFile];
+  if (config) {
+    const extraFile = join(dir, 'app-config.extra.yaml');
+    writeFileSync(extraFile, JSON.stringify(config));
+    configArgs.push('--config', extraFile);
+  }
+
   const child = spawn(
     process.execPath,
-    ['--import', 'tsx', 'src/index.ts', '--config', 'app-config.yaml', '--config', configFile],
+    ['--import', 'tsx', 'src/index.ts', ...configArgs],
     {
       cwd: backendDir,
       env: { ...process.env, NODE_EXTRA_CA_CERTS: join(certDir, 'cert.pem'), NODE_ENV: 'test' },
@@ -111,11 +133,52 @@ export async function startBackend({ http2 = true, expressBridge = true, upstrea
   };
 }
 
-/** One HTTP/2 connection; returns a request function bound to it. */
-export function h2Session(url, ca) {
-  const session = http2.connect(url, { ca });
+/**
+ * One HTTP/2 connection; returns a request function bound to it.
+ *
+ * Like browsers, requests wait when the server's maxConcurrentStreams is
+ * reached (Node's client doesn't do that itself). `queue: false` sends
+ * immediately, to test what the server does with excess streams.
+ */
+export function h2Session(url, ca, connectOptions = {}) {
+  const session = http2.connect(url, { ca, ...connectOptions });
   session.on('error', () => {});
-  const request = (path, { method = 'GET', headers = {}, body, timeout = 10_000 } = {}) =>
+
+  let limit = Infinity;
+  let active = 0;
+  const waiting = [];
+  const settingsReceived = new Promise(r =>
+    session.once('remoteSettings', settings => {
+      limit = settings.maxConcurrentStreams;
+      r();
+    }),
+  );
+  const acquire = async () => {
+    await settingsReceived;
+    if (active < limit) {
+      active += 1;
+      return;
+    }
+    // release() hands its slot over, so `active` stays the same.
+    await new Promise(r => waiting.push(r));
+  };
+  const release = () => {
+    const next = waiting.shift();
+    if (next) next();
+    else active -= 1;
+  };
+
+  const request = async (path, { queue = true, ...options } = {}) => {
+    if (!queue) return send(path, options);
+    await acquire();
+    try {
+      return await send(path, options);
+    } finally {
+      release();
+    }
+  };
+
+  const send = (path, { method = 'GET', headers = {}, body, timeout = 10_000 } = {}) =>
     new Promise((resolve, reject) => {
       const stream = session.request({ ':method': method, ':path': path, ...headers });
       stream.setTimeout(timeout, () => {
@@ -131,9 +194,16 @@ export function h2Session(url, ca) {
           resolve(toResponse(responseHeaders[':status'], responseHeaders, chunks, 'h2'));
         }
       });
-      stream.on('error', reject);
+      stream.on('error', error => {
+        error.rstCode = stream.rstCode;
+        reject(error);
+      });
       stream.on('close', () => {
-        if (!responseHeaders) reject(new Error(`stream closed without a response (code ${stream.rstCode})`));
+        if (!responseHeaders) {
+          const error = new Error(`stream closed without a response (code ${stream.rstCode})`);
+          error.rstCode = stream.rstCode;
+          reject(error);
+        }
       });
       stream.end(body);
     });
@@ -141,6 +211,7 @@ export function h2Session(url, ca) {
     request,
     alpn: () => session.alpnProtocol,
     remoteSettings: () => session.remoteSettings,
+    session,
     close: () => session.close(),
   };
 }
@@ -148,7 +219,10 @@ export function h2Session(url, ca) {
 /** HTTP/1.1 over TLS (the client offers only http/1.1 in ALPN). */
 export function h1Request(url, path, { method = 'GET', headers = {}, body, ca } = {}) {
   return new Promise((resolve, reject) => {
-    const req = https.request(new URL(path, url), { method, headers, ca, agent: false }, res => {
+    // servername: verify the certificate against the URL even when a test
+    // overrides the Host header.
+    const servername = new URL(url).hostname;
+    const req = https.request(new URL(path, url), { method, headers, ca, servername, agent: false }, res => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
       res.on('end', () =>

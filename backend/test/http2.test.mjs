@@ -1,6 +1,6 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { h1Request, h2Session, startBackend, startUpstream } from './helpers.mjs';
+import { STATIC_TOKENS, h1Request, h2Session, startBackend, startUpstream } from './helpers.mjs';
 
 describe('Backstage backend over HTTP/2 with the Express bridge', () => {
   let backend, upstream, h2;
@@ -154,6 +154,116 @@ describe('Backstage backend over HTTP/2 with the Express bridge', () => {
     const seen = upstream.seen.at(-1);
     assert.equal(seen.httpVersion, '1.1');
     assert.ok(!Object.keys(seen.headers).some(h => h.startsWith(':')), 'no pseudo-headers upstream');
+  });
+
+  it('keeps auth separate between concurrent requests from different users', async () => {
+    // One connection carrying several users' requests at once, as a proxy
+    // that multiplexes users onto one upstream HTTP/2 connection would.
+    const guest = await h2.request('/api/auth/guest/refresh', {
+      headers: { 'x-requested-with': 'XMLHttpRequest' },
+    });
+    const identities = {
+      guest: { authorization: `Bearer ${guest.json.backstageIdentity.token}` },
+      alice: { authorization: `Bearer ${STATIC_TOKENS.alice}` },
+      bob: { authorization: `Bearer ${STATIC_TOKENS.bob}` },
+      anonymous: {},
+    };
+    const names = Object.keys(identities);
+
+    // What each identity resolves to on its own, one request at a time.
+    const expected = {};
+    for (const name of names) {
+      const res = await h1Request(backend.url, '/api/probe/whoami', {
+        ca: backend.ca,
+        headers: identities[name],
+      });
+      assert.equal(res.status, 200, res.text);
+      const { tag: _tag, ...principal } = res.json;
+      expected[name] = principal;
+    }
+    assert.equal(expected.guest.type, 'user');
+    assert.equal(expected.alice.type, 'service');
+    assert.match(expected.alice.subject, /alice/);
+    assert.match(expected.bob.subject, /bob/);
+    assert.equal(expected.anonymous.type, 'none');
+
+    // Now interleave them: 400 HTTP/2 requests on one connection plus 40
+    // HTTP/1.1 requests, all in flight together.
+    const calls = Array.from({ length: 440 }, (_, i) => {
+      const name = names[i % names.length];
+      const headers = { ...identities[name], 'x-test-tag': `${name}-${i}` };
+      const res =
+        i < 400
+          ? h2.request('/api/probe/whoami', { headers })
+          : h1Request(backend.url, '/api/probe/whoami', { ca: backend.ca, headers });
+      return res.then(r => ({ name, i, r }));
+    });
+    for (const { name, i, r } of await Promise.all(calls)) {
+      assert.equal(r.status, 200);
+      const { tag, ...principal } = r.json;
+      assert.equal(tag, `${name}-${i}`);
+      assert.deepEqual(principal, expected[name], `request ${i} (${name})`);
+    }
+  });
+
+  it('answers 421 for hosts this backend does not serve', async () => {
+    const other = await h2.request('/api/probe/info', {
+      headers: { ':authority': 'other-app.example.com' },
+    });
+    assert.equal(other.status, 421);
+    assert.equal(other.json.error.name, 'MisdirectedRequestError');
+    assert.match(backend.output(), /Rejected HTTP\/2 request for authority 'other-app.example.com'/);
+
+    // baseUrl's host (any case) and backend.http2.allowedHosts are served.
+    const port = new URL(backend.url).port;
+    for (const authority of [`LOCALHOST:${port}`, 'alias.example.com']) {
+      const res = await h2.request('/api/probe/info', { headers: { ':authority': authority } });
+      assert.equal(res.status, 200, authority);
+    }
+
+    // HTTP/1.1 has no connection coalescing, so it isn't checked.
+    const h1 = await h1Request(backend.url, '/api/probe/info', {
+      ca: backend.ca,
+      headers: { host: 'other-app.example.com' },
+    });
+    assert.equal(h1.status, 200);
+  });
+
+  it('limits parallel streams per connection and header size', async () => {
+    const settings = h2.remoteSettings();
+    assert.equal(settings.maxConcurrentStreams, 100);
+    assert.equal(settings.maxHeaderListSize, 16384);
+
+    // A client that ignores the limit gets the excess streams refused.
+    // REFUSED_STREAM tells clients the request was not processed.
+    // Node's client assumes 100 streams until the server's SETTINGS arrive;
+    // assuming more makes it send all 150 right away, like a misbehaving client.
+    const raw = h2Session(backend.url, backend.ca, { peerMaxConcurrentStreams: 1000 });
+    try {
+      const results = await Promise.allSettled(
+        Array.from({ length: 150 }, () =>
+          raw.request('/api/probe/events?count=1&interval=200', { queue: false }),
+        ),
+      );
+      const ok = results.filter(r => r.status === 'fulfilled');
+      const refused = results.filter(r => r.status === 'rejected');
+      assert.ok(ok.every(r => r.value.status === 200));
+      assert.ok(ok.length >= 100, `only ${ok.length} succeeded`);
+      assert.ok(refused.length > 0, 'nothing was refused');
+      assert.ok(
+        refused.every(r => r.reason.rstCode === 7),
+        refused.map(r => r.reason.message).join(', '),
+      );
+
+      // Headers over the limit reset that stream only (ENHANCE_YOUR_CALM).
+      await assert.rejects(
+        raw.request('/api/probe/info', { headers: { 'x-big': 'a'.repeat(20_000) } }),
+        e => e.rstCode === 11,
+      );
+      assert.equal((await raw.request('/api/probe/info')).status, 200);
+    } finally {
+      raw.close();
+    }
   });
 
   it('handles many multiplexed h2 streams mixed with h1 requests', async () => {

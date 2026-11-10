@@ -13,8 +13,12 @@ export const probePlugin = createBackendPlugin({
   pluginId: 'probe',
   register(env) {
     env.registerInit({
-      deps: { httpRouter: coreServices.httpRouter, signals: signalsServiceRef },
-      async init({ httpRouter, signals }) {
+      deps: {
+        httpRouter: coreServices.httpRouter,
+        httpAuth: coreServices.httpAuth,
+        signals: signalsServiceRef,
+      },
+      async init({ httpRouter, httpAuth, signals }) {
         const router = Router();
         router.use(express.json());
 
@@ -29,6 +33,20 @@ export const probePlugin = createBackendPlugin({
             originalUrl: req.originalUrl,
             query: req.query,
             userAgent: req.get('user-agent'),
+          });
+        });
+
+        // Who Backstage thinks is calling, from this request's own token.
+        router.get('/whoami', async (req, res) => {
+          const credentials = await httpAuth.credentials(req, {
+            allow: ['user', 'service', 'none'],
+          });
+          const p = credentials.principal as any;
+          res.json({
+            type: p.type,
+            user: p.userEntityRef,
+            subject: p.subject,
+            tag: req.get('x-test-tag'),
           });
         });
 
@@ -48,7 +66,10 @@ export const probePlugin = createBackendPlugin({
 
         // Server-sent events, written the way many plugins do it, including
         // a `Connection: keep-alive` header that HTTP/2 forbids.
-        router.get('/events', (_req, res) => {
+        // ?count= and ?interval= (ms) control the stream's length and gaps.
+        router.get('/events', (req, res) => {
+          const count = Number(req.query.count ?? 3);
+          const interval = Number(req.query.interval ?? 20);
           res.writeHead(200, {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
@@ -58,11 +79,11 @@ export const probePlugin = createBackendPlugin({
           const timer = setInterval(() => {
             n += 1;
             res.write(`data: ${n}\n\n`);
-            if (n === 3) {
+            if (n >= count) {
               clearInterval(timer);
               res.end();
             }
-          }, 20);
+          }, interval);
         });
 
         // Sets HTTP/1 connection-specific headers, which HTTP/2 forbids.
