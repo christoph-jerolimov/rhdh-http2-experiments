@@ -28,7 +28,8 @@ curl -k --http2 https://localhost:7007/api/probe/info
 
 The response contains `"httpVersion":"2.0"`. With `--http1.1` it shows `"1.1"`.
 
-Tests (start the backend in a child process, about 10 seconds):
+Tests (start the backend in a child process, about 15 seconds; the Chromium
+test is skipped if Playwright isn't installed):
 
 ```bash
 cd backend && npm test
@@ -41,8 +42,9 @@ cd backend && npm test
 | `backend/src/http2/http2RootHttpRouterServiceFactory.ts` | Replaces Backstage's `rootHttpRouter` service. It is a trimmed copy of the upstream factory that creates an HTTP/2 server instead of `https.createServer`. |
 | `backend/src/http2/createHttp2Server.ts` | `http2.createSecureServer({ allowHTTP1: true })` with the `start`/`stop`/`port` methods Backstage expects. Clients without `h2` in ALPN still get HTTP/1.1. |
 | `backend/src/http2/expressHttp2Bridge.ts` | Makes Express handle `Http2ServerRequest`/`Http2ServerResponse`. |
-| `backend/src/plugins/probe.ts` | Test plugin at `/api/probe` (request info, JSON body, redirect, gzip, SSE, errors). |
+| `backend/src/plugins/probe.ts` | Test plugin at `/api/probe` (request info, JSON body, redirect, gzip, SSE, errors, publishing a signal). |
 | `backend/test/http2.test.mjs` | End-to-end tests over HTTP/2 and HTTP/1.1. |
+| `backend/test/websocket.test.mjs` | WebSocket tests with the signals plugin, including headless Chromium. |
 
 Config (`backend/app-config.yaml`), custom keys:
 
@@ -94,8 +96,26 @@ Covered by the tests, all over HTTP/2 unless noted:
 | 100 multiplexed HTTP/2 streams on one connection, mixed with 20 HTTP/1.1 requests | ✅ |
 | Without the bridge | HTTP/1.1 works; HTTP/2 crashes |
 
-Also checked by hand: headless Chromium negotiates `h2`
-(`nextHopProtocol === 'h2'`), and a `fetch` POST from the page works.
+### WebSockets
+
+WebSockets use the HTTP/1.1 `Upgrade` mechanism, which HTTP/2 doesn't have.
+RFC 8441 adds WebSockets over HTTP/2 (extended CONNECT), but only when the
+server advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`. Node doesn't by default
+and Backstage has no handler for it, so clients open a separate HTTP/1.1 TLS
+connection to the same port for the WebSocket. The HTTP/2 server hands those
+connections to Node's HTTP/1 code (`allowHTTP1`), which emits `upgrade` as usual.
+
+Tested with the signals plugin (`/api/signals`):
+
+| Check | Result |
+|---|---|
+| Server does not advertise RFC 8441, so clients fall back to HTTP/1.1 | ✅ |
+| Signals subscribes to `upgrade` via `req.socket.server` from an HTTP/2 request | ✅ (`req.socket` is a proxy for the TLS socket; `.server` still works) |
+| WebSocket connects; a signal published over HTTP/2 arrives on it | ✅ |
+| Upgrade without a valid token is rejected with 401 | ✅ |
+| HTTP/1.1 and HTTP/2 requests keep working while WebSockets are open | ✅ |
+| Chromium: page loaded over `h2`, WebSocket opened from it, signal received | ✅ |
+| Very first upgrade, before any request reached the signals plugin | 404, **same on stock Backstage** (tested). The plugin only subscribes to `upgrade` lazily; the frontend retries. |
 
 ## Caveats
 
@@ -104,8 +124,8 @@ Also checked by hand: headless Chromium negotiates `h2`
   With a self-signed certificate, start Node with
   `NODE_EXTRA_CA_CERTS=../certs/cert.pem`, which `npm start` does. Otherwise
   the catalog can't verify user tokens (401).
-- **WebSockets** need HTTP/1.1 `Upgrade`, which HTTP/2 doesn't have. Browsers
-  open a separate HTTP/1.1 connection for them; that path was not tested here.
+- **WebSockets** stay on HTTP/1.1 (see above). A proxy in front must allow
+  HTTP/1.1 upgrades on the same host.
 - **Express sub-apps.** Only the root app is patched. A plugin that mounts its
   own `express()` app (instead of `Router()`) would break over HTTP/2. None of
   the plugins here do. Check RHDH's dynamic plugins before relying on this.

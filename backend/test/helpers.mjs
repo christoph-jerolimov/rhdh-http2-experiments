@@ -40,7 +40,7 @@ export async function startUpstream() {
 }
 
 /** Starts the backend in a child process with extra config layered on top. */
-export async function startBackend({ expressBridge = true, upstreamPort } = {}) {
+export async function startBackend({ http2 = true, expressBridge = true, upstreamPort } = {}) {
   const ca = ensureCert();
   const port = await freePort();
   const dir = mkdtempSync(join(tmpdir(), 'h2-backend-'));
@@ -51,7 +51,7 @@ export async function startBackend({ expressBridge = true, upstreamPort } = {}) 
       backend: {
         baseUrl: `https://localhost:${port}`,
         listen: { port },
-        http2: { enabled: true, expressBridge },
+        http2: { enabled: http2, expressBridge },
       },
       proxy: {
         endpoints: {
@@ -137,7 +137,12 @@ export function h2Session(url, ca) {
       });
       stream.end(body);
     });
-  return { request, alpn: () => session.alpnProtocol, close: () => session.close() };
+  return {
+    request,
+    alpn: () => session.alpnProtocol,
+    remoteSettings: () => session.remoteSettings,
+    close: () => session.close(),
+  };
 }
 
 /** HTTP/1.1 over TLS (the client offers only http/1.1 in ALPN). */

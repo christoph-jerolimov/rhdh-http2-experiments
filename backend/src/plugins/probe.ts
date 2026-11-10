@@ -2,6 +2,7 @@ import {
   coreServices,
   createBackendPlugin,
 } from '@backstage/backend-plugin-api';
+import { signalsServiceRef } from '@backstage/plugin-signals-node';
 import express, { Router } from 'express';
 
 /**
@@ -12,8 +13,8 @@ export const probePlugin = createBackendPlugin({
   pluginId: 'probe',
   register(env) {
     env.registerInit({
-      deps: { httpRouter: coreServices.httpRouter },
-      async init({ httpRouter }) {
+      deps: { httpRouter: coreServices.httpRouter, signals: signalsServiceRef },
+      async init({ httpRouter, signals }) {
         const router = Router();
         router.use(express.json());
 
@@ -62,6 +63,15 @@ export const probePlugin = createBackendPlugin({
               res.end();
             }
           }, 20);
+        });
+
+        // Broadcasts a signal. Clients receive it over the signals plugin's
+        // WebSocket, so a test can trigger it over HTTP/2 and check that it
+        // arrives over the WebSocket.
+        router.post('/signal', async (req, res) => {
+          const { channel, message } = req.body;
+          await signals.publish({ recipients: { type: 'broadcast' }, channel, message });
+          res.status(202).json({ published: true });
         });
 
         // Errors thrown in handlers go through Backstage's error middleware.
