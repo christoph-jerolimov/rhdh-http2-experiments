@@ -78,6 +78,14 @@ app. For HTTP/2 requests it also:
   `Content-Length`. body-parser ignores bodies without one of those two
   headers, and HTTP/2 has no `Transfer-Encoding`. Without this, a streamed
   `fetch` body arrives as `{}`.
+- drops HTTP/1 connection-specific response headers (`Transfer-Encoding`,
+  `Keep-Alive`, `Connection`, `Proxy-Connection`, `Upgrade`, `HTTP2-Settings`,
+  and `TE` unless it is `trailers`), whether they are set via `setHeader`,
+  `appendHeader` or `writeHead`. HTTP/2 forbids them. Node drops `Connection`
+  with a warning but throws for the others, and Express's error handling then
+  throws again outside any handler. **One HTTP/2 request to a route that sets
+  e.g. `Transfer-Encoding` crashes the whole backend.** Each dropped header
+  is logged once.
 
 ## Results
 
@@ -90,7 +98,8 @@ Covered by the tests, all over HTTP/2 unless noted:
 | Health endpoints, helmet, CORS, 404 and error middleware | ✅ |
 | JSON bodies with and without `Content-Length` | ✅ (needs the bridge fix) |
 | Redirects, gzip compression of a 1 MB response | ✅ |
-| Server-sent events | ✅ Node drops the `Connection: keep-alive` header with an `UnsupportedWarning` |
+| Server-sent events | ✅ (the bridge drops the `Connection: keep-alive` header) |
+| Routes that set `Transfer-Encoding`, `Keep-Alive`, `Upgrade`, ... via any header API | ✅ headers dropped (needs the bridge fix; without it the backend crashes). HTTP/1.1 responses keep them. |
 | Guest sign-in, catalog reads (`GET /entities`, `POST /entities/by-refs`) | ✅ |
 | Proxy plugin to an HTTP/1.1 upstream | ✅ (needs the pseudo-header fix). Node warns that HTTP/2 has no status message. |
 | 100 multiplexed HTTP/2 streams on one connection, mixed with 20 HTTP/1.1 requests | ✅ |
@@ -140,3 +149,20 @@ Tested with the signals plugin (`/api/signals`):
 The low-risk way to get HTTP/2 to browsers is to terminate it at the edge
 (OpenShift route/ingress, nginx, Envoy) and keep the backend on HTTP/1.1.
 Most of the HTTP/2 benefit is between the browser and the edge.
+
+## Excluding specific APIs from HTTP/2?
+
+Not possible on the same host and port. The HTTP version is chosen per TLS
+connection (ALPN) before the server sees a path, and the browser sends every
+request for the origin over that one connection.
+
+The only per-request escape is resetting the stream with `HTTP_1_1_REQUIRED`.
+Tested in Chromium: the browser retries that request over HTTP/1.1, but then
+stays on HTTP/1.1 for every later request from the page. One excluded route
+turns HTTP/2 off for the whole app.
+
+It isn't needed for upgrades: WebSockets already use a separate HTTP/1.1
+connection (see above). If a plugin really needs HTTP/1.1, serve it from a
+second, HTTP/1.1-only origin (another port or hostname) and point the frontend
+at it with `discovery.endpoints`. That costs CORS and an extra route.
+`backend.http2.enabled: false` is the global switch.

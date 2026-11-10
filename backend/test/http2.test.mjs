@@ -91,6 +91,32 @@ describe('Backstage backend over HTTP/2 with the Express bridge', () => {
     assert.equal(res.text, 'data: 1\n\ndata: 2\n\ndata: 3\n\n');
   });
 
+  it('drops HTTP/1 connection-specific headers instead of crashing', async () => {
+    const forbidden = ['transfer-encoding', 'keep-alive', 'connection', 'proxy-connection', 'upgrade', 'te'];
+    for (const via of ['setHeader', 'appendHeader', 'writeHead', 'writeHeadTuples', 'writeHeadFlat']) {
+      const res = await h2.request(`/api/probe/hop-by-hop?via=${via}`);
+      assert.equal(res.status, 200, `${via}: ${res.text}`);
+      assert.equal(res.text, 'hop-by-hop ok', via);
+      assert.equal(res.headers['x-kept'], 'yes', via);
+      for (const name of forbidden) {
+        assert.equal(res.headers[name], undefined, `${via}: ${name}`);
+      }
+    }
+    // The backend is still alive.
+    assert.equal((await h2.request('/api/probe/info')).status, 200);
+    assert.match(backend.output(), /Dropped HTTP\/1 header 'transfer-encoding'/);
+    assert.doesNotMatch(backend.output(), /ERR_HTTP2_INVALID_CONNECTION_HEADERS/);
+  });
+
+  it('leaves HTTP/1.1 responses alone', async () => {
+    const res = await h1Request(backend.url, '/api/probe/hop-by-hop?via=writeHead', {
+      ca: backend.ca,
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers['keep-alive'], 'timeout=5');
+    assert.equal(res.headers['x-kept'], 'yes');
+  });
+
   it('signs in as guest and reads the catalog', async () => {
     const refresh = await h2.request('/api/auth/guest/refresh', {
       headers: { 'x-requested-with': 'XMLHttpRequest' },

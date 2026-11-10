@@ -60,7 +60,9 @@ export const http2RootHttpRouterServiceFactory = (
 
       let server;
       if (http2Enabled) {
-        const listener = bridgeEnabled ? createExpressHttp2Listener(app) : app;
+        const listener = bridgeEnabled
+          ? createExpressHttp2Listener(app, { logger })
+          : app;
         if (!bridgeEnabled) {
           logger.warn(
             'backend.http2.expressBridge is false: HTTP/2 requests will fail',

@@ -65,6 +65,40 @@ export const probePlugin = createBackendPlugin({
           }, 20);
         });
 
+        // Sets HTTP/1 connection-specific headers, which HTTP/2 forbids.
+        // Without the bridge's header filter, one HTTP/2 request here
+        // crashes the whole backend. ?via= picks the Node API used.
+        router.get('/hop-by-hop', (req, res) => {
+          const forbidden: Record<string, string> = {
+            'Transfer-Encoding': 'chunked',
+            'Keep-Alive': 'timeout=5',
+            Connection: 'keep-alive',
+            'Proxy-Connection': 'keep-alive',
+            Upgrade: 'h2c',
+            TE: 'gzip',
+          };
+          const headers = { ...forbidden, 'X-Kept': 'yes', 'Content-Type': 'text/plain' };
+          const body = 'hop-by-hop ok';
+          switch (req.query.via) {
+            case 'appendHeader':
+              for (const [n, v] of Object.entries(headers)) res.appendHeader(n, v);
+              res.end(body);
+              return;
+            case 'writeHead':
+              res.writeHead(200, headers).end(body);
+              return;
+            case 'writeHeadTuples':
+              res.writeHead(200, Object.entries(headers) as any).end(body);
+              return;
+            case 'writeHeadFlat':
+              res.writeHead(200, Object.entries(headers).flat() as any).end(body);
+              return;
+            default:
+              // setHeader via Express's res.set, then res.send.
+              res.set(headers).send(body);
+          }
+        });
+
         // Broadcasts a signal. Clients receive it over the signals plugin's
         // WebSocket, so a test can trigger it over HTTP/2 and check that it
         // arrives over the WebSocket.

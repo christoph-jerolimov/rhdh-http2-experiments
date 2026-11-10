@@ -23,11 +23,17 @@ type Listener = (
  * before each request enters the app. Express reads them synchronously while
  * handling the first middleware, so the swap cannot leak between requests.
  *
+ * HTTP/2 responses also drop HTTP/1 connection-specific headers (see
+ * createHeaderFilter below).
+ *
  * Only the app passed in here is patched. Express sub-apps (`express()`
  * mounted inside another app) would need the same treatment; Backstage
  * plugins use `Router()`, which never touches the prototypes.
  */
-export function createExpressHttp2Listener(app: Express): Listener {
+export function createExpressHttp2Listener(
+  app: Express,
+  options: { logger?: { warn(message: string): void } } = {},
+): Listener {
   const http1Protos = { request: app.request, response: app.response };
   const http2Protos = {
     request: rebasePrototypeChain(
@@ -38,7 +44,7 @@ export function createExpressHttp2Listener(app: Express): Listener {
     response: rebasePrototypeChain(
       app.response,
       http.ServerResponse.prototype,
-      http2.Http2ServerResponse.prototype,
+      createHeaderFilter(http2.Http2ServerResponse.prototype, options.logger),
     ),
   };
 
@@ -108,3 +114,113 @@ function rebasePrototypeChain<T extends object>(
     newBase,
   ) as T;
 }
+
+/**
+ * HTTP/2 forbids HTTP/1 connection-specific headers (RFC 9113 8.2.2). Node
+ * drops `Connection` with a warning but throws ERR_HTTP2_INVALID_CONNECTION_HEADERS
+ * for the others when the response is sent. Express catches that, tries to
+ * send an error response with the same headers, which throws again outside
+ * any handler and crashes the whole process. One request to a route that sets
+ * e.g. `Transfer-Encoding` would take down the backend.
+ *
+ * Returns a prototype layer on top of Http2ServerResponse.prototype that
+ * silently drops these headers in setHeader, appendHeader and writeHead.
+ * HTTP/2 handles framing and connection management itself, so dropping them
+ * does not change what the client receives.
+ */
+function createHeaderFilter(
+  base: http2.Http2ServerResponse,
+  logger?: { warn(message: string): void },
+): object {
+  const warned = new Set<string>();
+  const isForbidden = (name: unknown, value: unknown) => {
+    if (typeof name !== 'string') return false;
+    const lower = name.toLowerCase();
+    if (lower === 'te') return String(value).toLowerCase() !== 'trailers';
+    return CONNECTION_SPECIFIC_HEADERS.has(lower);
+  };
+  const drop = (name: string) => {
+    const lower = name.toLowerCase();
+    if (logger && !warned.has(lower)) {
+      warned.add(lower);
+      logger.warn(
+        `Dropped HTTP/1 header '${lower}' from an HTTP/2 response; logged once per header`,
+      );
+    }
+  };
+
+  return Object.create(base, {
+    setHeader: {
+      value(this: http2.Http2ServerResponse, name: string, value: any) {
+        if (isForbidden(name, value)) {
+          drop(name);
+          return this;
+        }
+        return base.setHeader.call(this, name, value);
+      },
+      writable: true,
+      configurable: true,
+    },
+    appendHeader: {
+      value(this: http2.Http2ServerResponse, name: string, value: any) {
+        if (isForbidden(name, value)) {
+          drop(name);
+          return this;
+        }
+        return base.appendHeader.call(this, name, value);
+      },
+      writable: true,
+      configurable: true,
+    },
+    writeHead: {
+      value(
+        this: http2.Http2ServerResponse,
+        statusCode: number,
+        statusMessage?: any,
+        headers?: any,
+      ) {
+        if (headers === undefined && typeof statusMessage === 'object') {
+          headers = statusMessage;
+          statusMessage = undefined;
+        }
+        if (Array.isArray(headers)) {
+          if (headers.length > 0 && Array.isArray(headers[0])) {
+            // [[name, value], ...]
+            headers = headers.filter(([n, v]: [string, unknown]) =>
+              isForbidden(n, v) ? (drop(n), false) : true,
+            );
+          } else {
+            // [name, value, name, value, ...]
+            const flat: unknown[] = [];
+            for (let i = 0; i < headers.length; i += 2) {
+              if (isForbidden(headers[i], headers[i + 1])) drop(headers[i]);
+              else flat.push(headers[i], headers[i + 1]);
+            }
+            headers = flat;
+          }
+        } else if (headers) {
+          headers = Object.fromEntries(
+            Object.entries(headers).filter(([n, v]) =>
+              isForbidden(n, v) ? (drop(n), false) : true,
+            ),
+          );
+        }
+        // HTTP/2 has no status message; Node only warns about it.
+        return (base.writeHead as Function).call(this, statusCode, headers);
+      },
+      writable: true,
+      configurable: true,
+    },
+  });
+}
+
+// The headers Node rejects in HTTP/2 responses, besides `te` (allowed only
+// with the value "trailers").
+const CONNECTION_SPECIFIC_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-connection',
+  'transfer-encoding',
+  'upgrade',
+  'http2-settings',
+]);
